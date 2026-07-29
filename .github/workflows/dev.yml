@@ -1,0 +1,190 @@
+name: chat-demo Dev APK
+
+on:
+  push:
+    branches:
+      - "main"
+      - "dev"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chat-demo-dev-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PROJECT_DIR: "."
+  ANDROID_PROJECT_DIR: "android"
+  APK_SEARCH_DIR: "android/app/build/outputs/apk/release"
+  REPOSITORY_NAME: "chat-demo"
+  GRADLE_OPTS: "-Xmx4g -XX:MaxMetaspaceSize=768m -Dkotlin.daemon.jvm.options=-Xmx2g -Dorg.gradle.daemon=false"
+
+jobs:
+  build-apk:
+    name: Build release APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 16
+        uses: actions/setup-node@v4
+        with:
+          node-version: "16"
+
+      - name: Cache JS dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/yarn
+            ~/.npm
+            ~/.pnpm-store
+            node_modules
+          key: ${{ runner.os }}-js-${{ hashFiles('yarn.lock', 'package-lock.json', 'pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-js-
+
+      - name: Install JS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          corepack enable || true
+          if [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile || yarn install
+          elif [ -f package-lock.json ]; then
+            npm ci || npm install
+          elif [ -f pnpm-lock.yaml ]; then
+            pnpm install --frozen-lockfile || pnpm install
+          else
+            npm install
+          fi
+
+      - name: Setup Java 17 for Android SDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .gradle
+            android/.gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', 'gradle/wrapper/gradle-wrapper.properties', 'android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Accept Android licenses
+        shell: bash
+        run: yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          SEARCH_DIR="$ANDROID_PROJECT_DIR"
+          if [ ! -d "$SEARCH_DIR" ]; then SEARCH_DIR="$PROJECT_DIR"; fi
+          COMPILE_SDK=$(grep -RhoE 'compileSdk(Version)?[[:space:]=]+[0-9]+' "$SEARCH_DIR" 2>/dev/null | grep -Eo '[0-9]+' | sort -nr | head -n1 || true)
+          if [ -z "$COMPILE_SDK" ]; then COMPILE_SDK=35; fi
+          BUILD_TOOLS=$(grep -RhoE 'buildToolsVersion[^0-9]*[0-9]+(\.[0-9]+)+' "$SEARCH_DIR" 2>/dev/null | grep -Eo '[0-9]+(\.[0-9]+)+' | sort -Vr | head -n1 || true)
+          packages=("platform-tools" "platforms;android-${COMPILE_SDK}")
+          if [ -n "$BUILD_TOOLS" ]; then packages+=("build-tools;${BUILD_TOOLS}"); fi
+          sdkmanager "${packages[@]}"
+
+      - name: Setup Java 11 for Gradle build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      - name: Set version env
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION_NAME=""
+          if [ -f "${PROJECT_DIR}/pubspec.yaml" ]; then
+            VERSION_NAME=$(awk -F': *' '/^version:/{print $2; exit}' "${PROJECT_DIR}/pubspec.yaml" | cut -d+ -f1 || true)
+          fi
+          if [ -z "$VERSION_NAME" ]; then
+            for f in "${PROJECT_DIR}/android/app/build.gradle" "${PROJECT_DIR}/android/app/build.gradle.kts" "${PROJECT_DIR}/app/build.gradle" "${PROJECT_DIR}/app/build.gradle.kts"; do
+              if [ -f "$f" ]; then
+                VERSION_NAME=$(perl -ne "if(/versionName\s*[= ]\s*[\"']?([^\"'\s)]+)/){print \$1; exit}" "$f" || true)
+                [ -n "$VERSION_NAME" ] && break
+              fi
+            done
+          fi
+          if [ -z "$VERSION_NAME" ] && [ -f "${PROJECT_DIR}/config.xml" ]; then
+            VERSION_NAME=$(grep -Eo 'version="[^"]+"' "${PROJECT_DIR}/config.xml" | head -n1 | cut -d'"' -f2 || true)
+          fi
+          if [ -z "$VERSION_NAME" ]; then
+            VERSION_NAME="0.1.${GITHUB_RUN_NUMBER}"
+          fi
+          VERSION_NAME=$(printf "%s" "$VERSION_NAME" | tr -cd 'A-Za-z0-9._-')
+          if [ -z "$VERSION_NAME" ] || ! printf "%s" "$VERSION_NAME" | grep -Eq '[0-9]'; then
+            VERSION_NAME="0.1.${GITHUB_RUN_NUMBER}"
+          fi
+          APK_BASENAME="${REPOSITORY_NAME}-dev-v${VERSION_NAME}.apk"
+          echo "VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "APK_BASENAME=$APK_BASENAME" >> "$GITHUB_ENV"
+
+
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ANDROID_PROJECT_DIR"
+          chmod +x gradlew
+          set -o pipefail
+          ./gradlew assembleRelease --build-cache --stacktrace --no-daemon --console=plain 2>&1 | tee gradle-assemble-release.log
+      - name: Locate APK
+        id: apk
+        shell: bash
+        run: |
+          set -euo pipefail
+          SEARCH_DIR="$APK_SEARCH_DIR"
+          if [ ! -d "$SEARCH_DIR" ]; then SEARCH_DIR="$PROJECT_DIR"; fi
+          APK_PATH=$(find "$SEARCH_DIR" -type f \( -name '*release*.apk' -o -name 'app-release.apk' \) | grep -v '/intermediates/' | head -n1 || true)
+          if [ -z "$APK_PATH" ]; then
+            echo "No release APK found"
+            find "$PROJECT_DIR" -path '*outputs*' -type f || true
+            exit 1
+          fi
+          cp "$APK_PATH" "$APK_BASENAME"
+          echo "path=$APK_BASENAME" >> "$GITHUB_OUTPUT"
+          ls -lh "$APK_BASENAME"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.REPOSITORY_NAME }}-dev-${{ github.sha }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Email release APK via SRTLK
+        env:
+          SRTLK_TOKEN: ${{ secrets.ENV_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$SRTLK_TOKEN" ]; then
+            echo "Missing ENV_API_TOKEN secret for SRTLK upload"
+            exit 1
+          fi
+          curl --fail-with-body -X POST \
+            https://srtlk.in/api/v1/file \
+            -H "authorization: Bearer ${SRTLK_TOKEN}" \
+            -F "file=@${{ steps.apk.outputs.path }}" \
+            -F 'email="jigar@jstechno.com,developer11.jstechno@gmail.com,developer9.jstechno@gmail.com,qcofficer.jstechno@gmail.com"' \
+            -F "filename=${APK_BASENAME}"
